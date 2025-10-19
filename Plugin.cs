@@ -14,7 +14,7 @@ namespace ShipLootTotal
     {
         public const string PluginGuid = "DaanSmoki.LethalCompany.ShipLootTotal";
         public const string PluginName = "Ship Loot Total";
-        public const string PluginVersion = "1.0.4";
+        public const string PluginVersion = "1.0.5";
 
         internal static ManualLogSource Log;
         internal static Harmony Harmony;
@@ -157,12 +157,21 @@ namespace ShipLootTotal
                 if (_hudType == null) return null;
             }
 
-            // Instance cache (Unity null-safe check)
-            if (_hudInstance == null || (_hudInstance is UnityEngine.Object uo && uo == null))
+            // Instance cache (Unity null-safe check) — and detect swaps
+            var prop = _hudType.GetProperty("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                   ?? _hudType.GetProperty("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+
+            var current = prop?.GetValue(null);
+
+            // Unity null checks for both current and cached
+            bool cachedDead = _hudInstance is UnityEngine.Object cu && cu == null;
+            bool currentDead = current is UnityEngine.Object nu && nu == null;
+
+            // If first time, dead, or instance changed → update & reset audio locator
+            if (_hudInstance == null || cachedDead || (!currentDead && !ReferenceEquals(_hudInstance, current)))
             {
-                var prop = _hudType.GetProperty("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
-                       ?? _hudType.GetProperty("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-                _hudInstance = prop?.GetValue(null);
+                _hudInstance = current;
+                HudAudioLocator.Reset();
             }
 
             return _hudInstance;
@@ -287,33 +296,70 @@ namespace ShipLootTotal
     internal static class HudAudioLocator
     {
         private static AudioSource _cached;
-        private static bool _tried;
         private static Type _hudType;
-        private static object _hud;
+        private static object _hudInstance;
+
+        public static void Reset()
+        {
+            _cached = null;
+            _hudType = null;
+            _hudInstance = null;
+        }
 
         public static AudioSource GetHudAudio()
         {
-            if (_cached != null || _tried) return _cached;
-            _tried = true;
+            // If cached AudioSource got destroyed by scene/save swap, drop it
+            if (_cached is UnityEngine.Object ao && ao == null)
+                _cached = null;
 
-            _hudType = _hudType ?? AccessTools.TypeByName("HUDManager");
-            if (_hudType == null) return null;
+            if (_cached != null)
+                return _cached;
 
-            _hud = _hud ?? _hudType.GetProperty("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(null);
-            if (_hud == null) return null;
+            // Re-acquire HUD type + instance (C# 7.3 compatible syntax)
+            if (_hudType == null)
+                _hudType = AccessTools.TypeByName("HUDManager");
 
-            var f = _hudType.GetField("UIAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                 ?? _hudType.GetField("uiAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            _cached = f?.GetValue(_hud) as AudioSource;
+            if (_hudType == null)
+                return null;
+
+            var prop = _hudType.GetProperty("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (prop == null)
+                prop = _hudType.GetProperty("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+
+            var inst = prop != null ? prop.GetValue(null) : null;
+
+            // If instance changed or is Unity-dead, forget cached and try again
+            bool oldDead = _hudInstance is UnityEngine.Object hu && hu == null;
+            bool newDead = inst is UnityEngine.Object hn && hn == null;
+            if (_hudInstance == null || oldDead || (!newDead && !ReferenceEquals(_hudInstance, inst)))
+            {
+                _hudInstance = inst;
+                _cached = null; // force re-find
+            }
+
+            if (_hudInstance == null)
+                return null;
+
+            // Try common fields/properties for UIAudio
+            var f = _hudType.GetField("UIAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (f == null)
+                f = _hudType.GetField("uiAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+            if (f != null)
+                _cached = f.GetValue(_hudInstance) as AudioSource;
 
             if (_cached == null)
             {
-                var p = _hudType.GetProperty("UIAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                     ?? _hudType.GetProperty("uiAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                _cached = p?.GetValue(_hud) as AudioSource;
+                var p = _hudType.GetProperty("UIAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (p == null)
+                    p = _hudType.GetProperty("uiAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+                if (p != null)
+                    _cached = p.GetValue(_hudInstance) as AudioSource;
             }
 
-            if (_cached == null && _hud is Component hudComp)
+            // Last resort: search under HUD object
+            if (_cached == null && _hudInstance is Component hudComp)
                 _cached = hudComp.GetComponentInChildren<AudioSource>(true);
 
             return _cached;
@@ -353,6 +399,14 @@ namespace ShipLootTotal
         }
     }
 
+    [HarmonyPatch(typeof(HUDManager), "Awake")]
+    public static class Patch_HUD_Awake_ResetAudioLocator
+    {
+        static void Postfix()
+        {
+            HudAudioLocator.Reset();
+        }
+    }
 
     internal static class Utils
     {
