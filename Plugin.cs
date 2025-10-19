@@ -1,4 +1,5 @@
 ﻿using BepInEx;
+using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
 using System;
@@ -22,10 +23,20 @@ namespace ShipLootTotal
         internal static bool SuppressNextHudSfx = false;     // set by HUDHelper for our next popup only
         internal static bool SuppressHudSfxActive = false;   // set by HUD method prefix during that specific call
 
+        internal static ConfigEntry<float> PopupDuration;
+
         private void Awake()
         {
             Log = Logger;
             Harmony = new Harmony(PluginGuid);
+
+            PopupDuration = Config.Bind(
+                "General",
+                "PopupDuration",
+                3f,
+                "How long (in seconds) the popup stays visible after scanning."
+            );
+
             Harmony.PatchAll();
             Log.LogInfo($"{PluginName} {PluginVersion} loaded.");
         }
@@ -134,7 +145,7 @@ namespace ShipLootTotal
                 if (_miDisplayGlobal != null)
                 {
                     _miDisplayGlobal.Invoke(hud, new object[] { bodyText });
-                    HudHideHelper.HideAfterSeconds(3f);
+                    HudHideHelper.HideAfterSeconds(Plugin.PopupDuration?.Value ?? 3f);
                     Plugin.Log?.LogInfo("HUDHelper: Used DisplayGlobalNotification(string) [silent].");
                 }
                 else
