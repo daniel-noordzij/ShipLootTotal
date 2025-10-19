@@ -15,7 +15,7 @@ namespace ShipLootTotal
     {
         public const string PluginGuid = "DaanSmoki.LethalCompany.ShipLootTotal";
         public const string PluginName = "Ship Loot Total";
-        public const string PluginVersion = "1.1.0";
+        public const string PluginVersion = "1.1.1";
 
         internal static ManualLogSource Log;
         internal static Harmony Harmony;
