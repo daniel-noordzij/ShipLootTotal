@@ -40,11 +40,6 @@ namespace ShipLootTotal
             Harmony.PatchAll();
             Log.LogInfo($"{PluginName} {PluginVersion} loaded.");
         }
-
-        private void OnDestroy()
-        {
-            Harmony?.UnpatchSelf();
-        }
     }
 
     // Patch: scan input handler in your build lives on HUDManager
