@@ -3,8 +3,8 @@ using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
 using System;
-using System.Linq;
 using System.Reflection;
+using System.Collections;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
@@ -15,13 +15,14 @@ namespace ShipLootTotal
     {
         public const string PluginGuid = "DaanSmoki.LethalCompany.ShipLootTotal";
         public const string PluginName = "Ship Loot Total";
-        public const string PluginVersion = "1.1.1";
+        public const string PluginVersion = "1.1.2";
 
         internal static ManualLogSource Log;
         internal static Harmony Harmony;
-        internal static float _lastScanPostfixAt = -999f; // debounce
-        internal static bool SuppressNextHudSfx = false;     // set by HUDHelper for our next popup only
-        internal static bool SuppressHudSfxActive = false;   // set by HUD method prefix during that specific call
+
+        internal static float _lastScanPostfixAt = -999f;   // debounce for scan action
+        internal static bool SuppressNextHudSfx = false;     // armed by HUDHelper for the next popup only
+        internal static bool SuppressHudSfxActive = false;   // toggled by HUD prefix for that specific call
 
         internal static ConfigEntry<float> PopupDuration;
 
@@ -38,11 +39,13 @@ namespace ShipLootTotal
             );
 
             Harmony.PatchAll();
-            Log.LogInfo($"{PluginName} {PluginVersion} loaded.");
+            ScrapValueSyncPatcher.Apply(Harmony);
+
+            Log.LogInfo(PluginName + " " + PluginVersion + " loaded.");
         }
     }
 
-    // Patch: scan input handler in your build lives on HUDManager
+    // Patch: Player scan input handler on HUDManager
     [HarmonyPatch(typeof(HUDManager))]
     public static class Patch_HUD_PingScan
     {
@@ -52,32 +55,38 @@ namespace ShipLootTotal
         {
             try
             {
-                if (!context.performed) return;
+                if (!context.performed)
+                    return;
 
-                // Debounce multiple performed events fired rapidly
-                if (Time.time - Plugin._lastScanPostfixAt < 0.25f) return;
+                // Debounce rapid events
+                if (Time.time - Plugin._lastScanPostfixAt < 0.25f)
+                    return;
                 Plugin._lastScanPostfixAt = Time.time;
 
                 var player = Utils.GetLocalPlayerController();
-                if (player == null) return;
-                if (!Utils.IsPlayerInShip(player)) return;
+                if (player == null)
+                    return;
+                if (!Utils.IsPlayerInShip(player))
+                    return;
 
+                Utils.InvalidateGrabbablesCache();
                 int total = Utils.SumShipScrapValues();
-                HUDHelper.ShowStable($"Total in Ship: {total}");
+                HUDHelper.ShowStable("Total in Ship: " + total);
 
-                Plugin.Log?.LogInfo($"ShipLootTotal: PingScan -> total={total}");
+                if (Plugin.Log != null) Plugin.Log.LogInfo("ShipLootTotal: PingScan -> total=" + total);
             }
             catch (Exception e)
             {
-                Plugin.Log?.LogError(e);
+                if (Plugin.Log != null) Plugin.Log.LogError(e);
             }
         }
     }
 
+    // Gate HUD SFX for our next popup only
     [HarmonyPatch]
     public static class Patch_HUD_Display_SilentGate
     {
-        // Patch DisplayGlobalNotification(string)
+        // Target DisplayGlobalNotification(string)
         static System.Collections.Generic.IEnumerable<MethodBase> TargetMethods()
         {
             var hudType = AccessTools.TypeByName("HUDManager");
@@ -87,15 +96,12 @@ namespace ShipLootTotal
             if (global != null) yield return global;
         }
 
-
-        // Before HUD shows a message, arm/clear the active flag from the "next" flag
         static void Prefix()
         {
             Plugin.SuppressHudSfxActive = Plugin.SuppressNextHudSfx;
-            Plugin.SuppressNextHudSfx = false; // consume it
+            Plugin.SuppressNextHudSfx = false; // consume arm
         }
 
-        // After the HUD call finishes, always drop the active flag
         static void Postfix()
         {
             Plugin.SuppressHudSfxActive = false;
@@ -104,7 +110,7 @@ namespace ShipLootTotal
 
     internal static class HUDHelper
     {
-        // Cache HUD singleton + method (validated each call in case scene reloads)
+        // Cached references (validated each call in case scenes reload)
         private static Type _hudType;
         private static object _hudInstance;
         private static MethodInfo _miDisplayGlobal;
@@ -116,17 +122,16 @@ namespace ShipLootTotal
                 var hud = GetHUDManager();
                 if (hud == null)
                 {
-                    Plugin.Log?.LogWarning("HUDHelper: HUDManager.Instance not found.");
+                    if (Plugin.Log != null) Plugin.Log.LogWarning("HUDHelper: HUDManager.Instance not found.");
                     return;
                 }
 
                 // Make this popup silent
                 Plugin.SuppressNextHudSfx = true;
 
-                // Ensure the panel is visible/active (alpha=1) before showing
+                // Ensure panel is visible before showing
                 HudHideHelper.PrepareForShow(hud);
 
-                // Cached method lookup
                 if (_miDisplayGlobal == null || _miDisplayGlobal.DeclaringType == null)
                 {
                     _miDisplayGlobal = hud.GetType().GetMethod(
@@ -140,40 +145,36 @@ namespace ShipLootTotal
                 if (_miDisplayGlobal != null)
                 {
                     _miDisplayGlobal.Invoke(hud, new object[] { bodyText });
-                    HudHideHelper.HideAfterSeconds(Plugin.PopupDuration?.Value ?? 3f);
-                    Plugin.Log?.LogInfo("HUDHelper: Used DisplayGlobalNotification(string) [silent].");
+                    HudHideHelper.HideAfterSeconds(Plugin.PopupDuration != null ? Plugin.PopupDuration.Value : 3f);
+                    if (Plugin.Log != null) Plugin.Log.LogInfo("HUDHelper: Used DisplayGlobalNotification(string) [silent].");
                 }
-                else
+                else if (Plugin.Log != null)
                 {
-                    Plugin.Log?.LogWarning("HUDHelper: DisplayGlobalNotification(string) not found.");
+                    Plugin.Log.LogWarning("HUDHelper: DisplayGlobalNotification(string) not found.");
                 }
             }
             catch (Exception ex)
             {
-                Plugin.Log?.LogWarning($"HUDHelper.ShowStable failed: {ex.GetType().Name}: {ex.Message}");
+                if (Plugin.Log != null) Plugin.Log.LogWarning("HUDHelper.ShowStable failed: " + ex.GetType().Name + ": " + ex.Message);
             }
         }
 
         internal static object GetHUDManager()
         {
-            // Type cache
             if (_hudType == null)
             {
                 _hudType = AccessTools.TypeByName("HUDManager");
                 if (_hudType == null) return null;
             }
 
-            // Instance cache (Unity null-safe check) — and detect swaps
             var prop = _hudType.GetProperty("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
-                   ?? _hudType.GetProperty("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                       ?? _hudType.GetProperty("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
 
-            var current = prop?.GetValue(null);
+            var current = prop != null ? prop.GetValue(null) : null;
 
-            // Unity null checks for both current and cached
-            bool cachedDead = _hudInstance is UnityEngine.Object cu && cu == null;
-            bool currentDead = current is UnityEngine.Object nu && nu == null;
+            bool cachedDead = _hudInstance is UnityEngine.Object && (UnityEngine.Object)_hudInstance == null;
+            bool currentDead = current is UnityEngine.Object && (UnityEngine.Object)current == null;
 
-            // If first time, dead, or instance changed → update & reset audio locator
             if (_hudInstance == null || cachedDead || (!currentDead && !ReferenceEquals(_hudInstance, current)))
             {
                 _hudInstance = current;
@@ -188,7 +189,6 @@ namespace ShipLootTotal
     {
         private static Coroutine _hideRoutine;
 
-        // Cache the panel + text (Unity-null aware)
         private static GameObject _panelGO;
         private static TMPro.TextMeshProUGUI _tmp;
 
@@ -230,7 +230,7 @@ namespace ShipLootTotal
             _hideRoutine = mono.StartCoroutine(HideCoroutine(hud, seconds));
         }
 
-        private static System.Collections.IEnumerator HideCoroutine(object hud, float seconds)
+        private static IEnumerator HideCoroutine(object hud, float seconds)
         {
             yield return new WaitForSeconds(seconds);
 
@@ -240,10 +240,16 @@ namespace ShipLootTotal
 
                 // Stop default coroutine if tracked (prevents flicker)
                 var fCo = hudType.GetField("globalNotificationCoroutine", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                if (fCo?.GetValue(hud) is Coroutine co && hud is MonoBehaviour mb)
+                if (fCo != null)
                 {
-                    mb.StopCoroutine(co);
-                    fCo.SetValue(hud, null);
+                    var val = fCo.GetValue(hud);
+                    var co = val as Coroutine;
+                    var mb = hud as MonoBehaviour;
+                    if (co != null && mb != null)
+                    {
+                        mb.StopCoroutine(co);
+                        fCo.SetValue(hud, null);
+                    }
                 }
 
                 EnsureCachedParts(hud);
@@ -254,23 +260,23 @@ namespace ShipLootTotal
                 if (_panelGO != null)
                 {
                     var cg = _panelGO.GetComponent<CanvasGroup>() ?? _panelGO.AddComponent<CanvasGroup>();
-                    cg.alpha = 0f;          // visually hidden (keep active for next time)
+                    cg.alpha = 0f; // visually hidden (keep active for next time)
                     cg.interactable = false;
                     cg.blocksRaycasts = false;
                 }
             }
             catch (Exception e)
             {
-                Plugin.Log?.LogWarning($"HudHideHelper: hide failed: {e.Message}");
+                if (Plugin.Log != null) Plugin.Log.LogWarning("HudHideHelper: hide failed: " + e.Message);
             }
         }
 
-        // Cache finder (runs only when needed or when Unity object was destroyed)
         private static void EnsureCachedParts(object hud)
         {
             if (_panelGO != null && _tmp != null) return;
-            if (_panelGO is UnityEngine.Object p && p == null) _panelGO = null;
-            if (_tmp is UnityEngine.Object t && t == null) _tmp = null;
+
+            if (_panelGO is UnityEngine.Object && (UnityEngine.Object)_panelGO == null) _panelGO = null;
+            if (_tmp is UnityEngine.Object && (UnityEngine.Object)_tmp == null) _tmp = null;
 
             if (_panelGO != null && _tmp != null) return;
 
@@ -279,16 +285,21 @@ namespace ShipLootTotal
             if (_tmp == null)
             {
                 var fText = hudType.GetField("globalNotificationText", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                _tmp = fText?.GetValue(hud) as TMPro.TextMeshProUGUI;
+                _tmp = fText != null ? fText.GetValue(hud) as TMPro.TextMeshProUGUI : null;
             }
 
             if (_panelGO == null)
             {
                 var fBG = hudType.GetField("globalNotificationBackground", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                var bgVal = fBG?.GetValue(hud);
+                var bgVal = fBG != null ? fBG.GetValue(hud) : null;
 
-                if (bgVal is GameObject go) _panelGO = go;
-                else if (bgVal is Component comp) _panelGO = comp.gameObject;
+                var go = bgVal as GameObject;
+                if (go != null) _panelGO = go;
+                else
+                {
+                    var comp = bgVal as Component;
+                    if (comp != null) _panelGO = comp.gameObject;
+                }
 
                 if (_panelGO == null && _tmp != null && _tmp.transform != null)
                 {
@@ -314,29 +325,26 @@ namespace ShipLootTotal
 
         public static AudioSource GetHudAudio()
         {
-            // If cached AudioSource got destroyed by scene/save swap, drop it
-            if (_cached is UnityEngine.Object ao && ao == null)
+            if (_cached is UnityEngine.Object && (UnityEngine.Object)_cached == null)
                 _cached = null;
 
             if (_cached != null)
                 return _cached;
 
-            // Re-acquire HUD type + instance (C# 7.3 compatible syntax)
             if (_hudType == null)
                 _hudType = AccessTools.TypeByName("HUDManager");
 
             if (_hudType == null)
                 return null;
 
-            var prop = _hudType.GetProperty("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-            if (prop == null)
-                prop = _hudType.GetProperty("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            var prop = _hudType.GetProperty("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                       ?? _hudType.GetProperty("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
 
             var inst = prop != null ? prop.GetValue(null) : null;
 
-            // If instance changed or is Unity-dead, forget cached and try again
-            bool oldDead = _hudInstance is UnityEngine.Object hu && hu == null;
-            bool newDead = inst is UnityEngine.Object hn && hn == null;
+            bool oldDead = _hudInstance is UnityEngine.Object && (UnityEngine.Object)_hudInstance == null;
+            bool newDead = inst is UnityEngine.Object && (UnityEngine.Object)inst == null;
+
             if (_hudInstance == null || oldDead || (!newDead && !ReferenceEquals(_hudInstance, inst)))
             {
                 _hudInstance = inst;
@@ -346,27 +354,25 @@ namespace ShipLootTotal
             if (_hudInstance == null)
                 return null;
 
-            // Try common fields/properties for UIAudio
-            var f = _hudType.GetField("UIAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            if (f == null)
-                f = _hudType.GetField("uiAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-
+            var f = _hudType.GetField("UIAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    ?? _hudType.GetField("uiAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
             if (f != null)
                 _cached = f.GetValue(_hudInstance) as AudioSource;
 
             if (_cached == null)
             {
-                var p = _hudType.GetProperty("UIAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                if (p == null)
-                    p = _hudType.GetProperty("uiAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-
+                var p = _hudType.GetProperty("UIAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                        ?? _hudType.GetProperty("uiAudio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                 if (p != null)
                     _cached = p.GetValue(_hudInstance) as AudioSource;
             }
 
-            // Last resort: search under HUD object
-            if (_cached == null && _hudInstance is Component hudComp)
-                _cached = hudComp.GetComponentInChildren<AudioSource>(true);
+            if (_cached == null)
+            {
+                var hudComp = _hudInstance as Component;
+                if (hudComp != null)
+                    _cached = hudComp.GetComponentInChildren<AudioSource>(true);
+            }
 
             return _cached;
         }
@@ -398,9 +404,8 @@ namespace ShipLootTotal
 
             var hudAudio = HudAudioLocator.GetHudAudio();
             if (hudAudio != null && __instance == hudAudio)
-            {
                 return false;
-            }
+
             return true;
         }
     }
@@ -434,7 +439,7 @@ namespace ShipLootTotal
         static FieldInfo _fi_PCB_isInHangar, _fi_PCB_isInShip, _fi_PCB_isLocal, _fi_PCB_isOwner;
 
         // ---- Cached object list (refresh window) ----
-        static UnityEngine.Object[] _grabbablesCache = Array.Empty<UnityEngine.Object>();
+        static UnityEngine.Object[] _grabbablesCache = new UnityEngine.Object[0];
         static float _lastCacheAt = -999f;
         private const float CacheWindowSeconds = 2f;
 
@@ -442,6 +447,11 @@ namespace ShipLootTotal
         static Bounds _shipBounds;
         static float _shipBoundsLastBuild = -999f;
         private const float ShipBoundsRebuildSeconds = 3f;
+        private const float ShipBoundsPadding = 8f; // generous padding to avoid false negatives
+
+        // ---- Parent-name heuristic (helps in scenes where flags/bounds lag) ----
+        private static readonly string[] _shipNameNeedles = new string[] { "ship", "hangar" };
+        private const int ParentHeuristicMaxDepth = 24;
 
         public static object GetLocalPlayerController()
         {
@@ -461,8 +471,9 @@ namespace ShipLootTotal
                 var sor = _pi_SOR_Instance.GetValue(null);
                 if (sor != null)
                 {
-                    var lpc = _fi_SOR_localPlayerController?.GetValue(sor)
-                           ?? _pi_SOR_localPlayerController?.GetValue(sor);
+                    var lpc = _fi_SOR_localPlayerController != null ? _fi_SOR_localPlayerController.GetValue(sor) : null;
+                    if (lpc == null && _pi_SOR_localPlayerController != null)
+                        lpc = _pi_SOR_localPlayerController.GetValue(sor);
                     if (lpc != null) return lpc;
                 }
             }
@@ -483,9 +494,10 @@ namespace ShipLootTotal
                 var gnm = _pi_GNM_Instance.GetValue(null);
                 if (gnm != null)
                 {
-                    var lpc = _fi_GNM_localPlayerController?.GetValue(gnm)
-                           ?? _pi_GNM_localPlayerController?.GetValue(gnm);
-                    if (lpc != null) return lpc;
+                    var lpc2 = _fi_GNM_localPlayerController != null ? _fi_GNM_localPlayerController.GetValue(gnm) : null;
+                    if (lpc2 == null && _pi_GNM_localPlayerController != null)
+                        lpc2 = _pi_GNM_localPlayerController.GetValue(gnm);
+                    if (lpc2 != null) return lpc2;
                 }
             }
 
@@ -505,23 +517,28 @@ namespace ShipLootTotal
                 _fi_PCB_isOwner = _pcbType.GetField("IsOwner", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
             }
 
-            // Only enforce these if the fields exist and have a value
-            bool? isLocal = _fi_PCB_isLocal?.GetValue(playerControllerB) as bool?;
+            bool? isLocal = _fi_PCB_isLocal != null ? (bool?)_fi_PCB_isLocal.GetValue(playerControllerB) : null;
             if (isLocal.HasValue && !isLocal.Value) return false;
 
-            bool? isOwner = _fi_PCB_isOwner?.GetValue(playerControllerB) as bool?;
+            bool? isOwner = _fi_PCB_isOwner != null ? (bool?)_fi_PCB_isOwner.GetValue(playerControllerB) : null;
             if (isOwner.HasValue && !isOwner.Value) return false;
 
-            bool? inHangar = _fi_PCB_isInHangar?.GetValue(playerControllerB) as bool?;
+            bool? inHangar = _fi_PCB_isInHangar != null ? (bool?)_fi_PCB_isInHangar.GetValue(playerControllerB) : null;
             if (inHangar.HasValue && inHangar.Value) return true;
 
-            bool? inShip = _fi_PCB_isInShip?.GetValue(playerControllerB) as bool?;
+            bool? inShip = _fi_PCB_isInShip != null ? (bool?)_fi_PCB_isInShip.GetValue(playerControllerB) : null;
             if (inShip.HasValue) return inShip.Value;
 
-            // Fallback: inside ship bounds
             var shipB = GetShipBounds();
-            var tr = (playerControllerB as Component)?.transform
-                  ?? _pcbType.GetProperty("transform")?.GetValue(playerControllerB) as Transform;
+            Transform tr = null;
+            var comp = playerControllerB as Component;
+            if (comp != null) tr = comp.transform;
+            else
+            {
+                var prop = _pcbType.GetProperty("transform");
+                if (prop != null) tr = prop.GetValue(playerControllerB, null) as Transform;
+            }
+
             if (tr != null && shipB.size != Vector3.zero)
                 return shipB.Contains(tr.position);
 
@@ -531,24 +548,35 @@ namespace ShipLootTotal
         private static Transform GetShipRootTransform()
         {
             if (_sorType == null) return null;
-            var inst = _pi_SOR_Instance?.GetValue(null);
+            var inst = _pi_SOR_Instance != null ? _pi_SOR_Instance.GetValue(null) : null;
             if (inst == null) return null;
 
-            var shipRoom = _sorType.GetField("shipRoom", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(inst) as GameObject;
-            if (shipRoom != null) return shipRoom.transform;
+            var shipRoom = _sorType.GetField("shipRoom", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (shipRoom != null)
+            {
+                var go = shipRoom.GetValue(inst) as GameObject;
+                if (go != null) return go.transform;
+            }
 
-            var hangarShip = _sorType.GetField("hangarShip", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(inst) as GameObject;
-            if (hangarShip != null) return hangarShip.transform;
+            var hangarShip = _sorType.GetField("hangarShip", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (hangarShip != null)
+            {
+                var go2 = hangarShip.GetValue(inst) as GameObject;
+                if (go2 != null) return go2.transform;
+            }
 
-            var shipFloor = _sorType.GetField("shipFloor", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(inst) as GameObject;
-            if (shipFloor != null) return shipFloor.transform;
+            var shipFloor = _sorType.GetField("shipFloor", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (shipFloor != null)
+            {
+                var go3 = shipFloor.GetValue(inst) as GameObject;
+                if (go3 != null) return go3.transform;
+            }
 
             return null;
         }
 
         private static Bounds GetShipBounds()
         {
-            // Rebuild occasionally
             if (Time.time - _shipBoundsLastBuild <= ShipBoundsRebuildSeconds && _shipBounds.size != Vector3.zero)
                 return _shipBounds;
 
@@ -565,13 +593,19 @@ namespace ShipLootTotal
                 for (int i = 1; i < colliders.Length; i++)
                     _shipBounds.Encapsulate(colliders[i].bounds);
 
-                _shipBounds.Expand(0.5f); // forgiving threshold
+                // Expand generously to catch edge placements / elevator lip
+                _shipBounds.Expand(ShipBoundsPadding);
+            }
+
+            if (_shipBounds.size == Vector3.zero)
+            {
+                if (Plugin.Log != null) Plugin.Log.LogInfo("[ShipLootTotal] Ship bounds empty, scheduling delayed rebuild.");
+                new GameObject("ShipBoundsRebuilder").AddComponent<ShipBoundsRebuilder>();
             }
 
             return _shipBounds;
         }
 
-        // ---------- Scrap total with caching, strict filtering, and precise location ----------
         private static UnityEngine.Object[] GetGrabbables()
         {
             if (_grabType == null)
@@ -589,12 +623,30 @@ namespace ShipLootTotal
                 }
             }
 
-            if (_grabType == null) return Array.Empty<UnityEngine.Object>();
+            if (_grabType == null) return new UnityEngine.Object[0];
 
             if (Time.time - _lastCacheAt > CacheWindowSeconds || _grabbablesCache == null)
             {
                 _lastCacheAt = Time.time;
-                _grabbablesCache = UnityEngine.Object.FindObjectsOfType(_grabType) as UnityEngine.Object[] ?? Array.Empty<UnityEngine.Object>();
+                var found = UnityEngine.Object.FindObjectsOfType(_grabType) as UnityEngine.Object[];
+                if (found == null || found.Length == 0)
+                {
+                    var all = Resources.FindObjectsOfTypeAll(_grabType) as UnityEngine.Object[];
+                    if (all != null && all.Length > 0)
+                    {
+                        var list = new System.Collections.Generic.List<UnityEngine.Object>(all.Length);
+                        for (int i = 0; i < all.Length; i++)
+                        {
+                            var comp = all[i] as Component;
+                            if (comp == null) continue;
+                            var go = comp.gameObject;
+                            if (!go.scene.IsValid()) continue; // skip assets/prefabs
+                            list.Add(all[i]);
+                        }
+                        found = list.ToArray();
+                    }
+                }
+                _grabbablesCache = found != null ? found : new UnityEngine.Object[0];
             }
 
             return _grabbablesCache;
@@ -605,7 +657,6 @@ namespace ShipLootTotal
             var list = GetGrabbables();
             if (list == null || list.Length == 0) return 0;
 
-            // Prepare ItemProperties reflection once (avoid LINQ alloc)
             if (_fi_ip_isScrap == null || _fi_ip_scrapValue == null)
             {
                 UnityEngine.Object any = null;
@@ -620,8 +671,8 @@ namespace ShipLootTotal
                     if (ip != null)
                     {
                         var ipt = ip.GetType();
-                        _fi_ip_isScrap = _fi_ip_isScrap ?? ipt.GetField("isScrap", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                        _fi_ip_scrapValue = _fi_ip_scrapValue ?? ipt.GetField("scrapValue", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (_fi_ip_isScrap == null) _fi_ip_isScrap = ipt.GetField("isScrap", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (_fi_ip_scrapValue == null) _fi_ip_scrapValue = ipt.GetField("scrapValue", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
                     }
                 }
             }
@@ -635,10 +686,8 @@ namespace ShipLootTotal
                 var go = list[i];
                 if (go == null) continue;
 
-                // Get transform once (reuse below)
-                var tr = (go as Component)?.transform;
+                var tr = (go as Component) != null ? ((Component)go).transform : null;
 
-                // ---- STRICT SCRAP FILTER ----
                 bool isScrap = false;
                 int val = 0;
 
@@ -651,7 +700,7 @@ namespace ShipLootTotal
                         if (os is bool && (bool)os) isScrap = true;
                     }
 
-                    if (!isScrap) continue; // ignore non-sellables
+                    if (!isScrap) continue;
 
                     if (_fi_ip_scrapValue != null)
                     {
@@ -661,7 +710,6 @@ namespace ShipLootTotal
                 }
                 else
                 {
-                    // If itemProperties missing, be conservative: skip
                     continue;
                 }
 
@@ -673,7 +721,6 @@ namespace ShipLootTotal
 
                 if (val <= 0) continue;
 
-                // ---- SKIP HELD/POCKETED ----
                 if (_fi_isHeld != null)
                 {
                     var oh = _fi_isHeld.GetValue(go);
@@ -684,36 +731,59 @@ namespace ShipLootTotal
                     var op = _fi_isPocketed.GetValue(go);
                     if (op is bool && (bool)op) continue;
                 }
-                if (_fi_playerHeldBy != null && _fi_playerHeldBy.GetValue(go) != null) continue;
 
-                // ---- IN SHIP CHECK ----
                 bool inShip = false;
 
-                // Direct flag
+                // 1) Trust the game flags when present
                 if (_fi_isInShipRoom != null)
                 {
                     var ir = _fi_isInShipRoom.GetValue(go);
                     if (ir is bool && (bool)ir) inShip = true;
                 }
 
-                // Treat in-elevator as in ship ONLY if near ship root (avoid map elevators)
+                // 2) Elevator counts as in-ship without distance requirement
                 if (!inShip && _fi_isInElevator != null)
                 {
                     var ie = _fi_isInElevator.GetValue(go);
                     if (ie is bool && (bool)ie)
+                        inShip = true;
+                }
+
+                // 3) Parent-name heuristic (fast and resilient)
+                if (!inShip && tr != null)
+                {
+                    int hops = 0; var p = tr;
+                    while (p != null && hops < ParentHeuristicMaxDepth)
                     {
-                        if (shipRoot != null && tr != null)
+                        var n = p.name;
+                        if (!string.IsNullOrEmpty(n))
                         {
-                            float dist = Vector3.Distance(tr.position, shipRoot.position);
-                            if (dist < 25f) inShip = true;
+                            var ln = n.ToLowerInvariant();
+                            for (int nn = 0; nn < _shipNameNeedles.Length; nn++)
+                            {
+                                if (ln.IndexOf(_shipNameNeedles[nn], StringComparison.Ordinal) >= 0)
+                                {
+                                    inShip = true;
+                                    break;
+                                }
+                            }
+                            if (inShip) break;
                         }
+                        p = p.parent; hops++;
                     }
                 }
 
-                // Bounds fallback for extra safety (reuse tr)
-                if (!inShip && shipB.size != Vector3.zero && tr != null)
+                // 4) Bounds check (with generous padding baked into bounds)
+                if (!inShip && tr != null && shipB.size != Vector3.zero)
                 {
-                    inShip = shipB.Contains(tr.position);
+                    if (shipB.Contains(tr.position)) inShip = true;
+                }
+
+                // 5) Proximity to ship root (horizontal distance)
+                if (!inShip && shipRoot != null && tr != null)
+                {
+                    var a = tr.position; var b = shipRoot.position; a.y = b.y;
+                    if (Vector3.Distance(a, b) < 30f) inShip = true;
                 }
 
                 if (!inShip) continue;
@@ -721,7 +791,116 @@ namespace ShipLootTotal
                 total += val;
             }
 
+            if (Plugin.Log != null) Plugin.Log.LogInfo("[DEBUG] Total=" + total + ", Objects=" + list.Length + ", Bounds=" + GetShipBounds().size);
             return total;
+        }
+
+        public static void InvalidateGrabbablesCache()
+        {
+            _grabbablesCache = new UnityEngine.Object[0];
+            _lastCacheAt = -999f;
+        }
+    }
+
+    internal static class ScrapValueSyncPatcher
+    {
+        public static void Apply(Harmony harmony)
+        {
+            var t = AccessTools.TypeByName("GrabbableObject");
+            if (t == null)
+            {
+                if (Plugin.Log != null) Plugin.Log.LogWarning("ScrapValueSyncPatcher: GrabbableObject type not found.");
+                return;
+            }
+
+            var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            var methods = t.GetMethods(flags);
+
+            string[] nameNeedles = new string[] { "ClientRpc", "SetScrap", "SyncScrap", "UpdateScrap", "ScrapValue" };
+
+            int patched = 0;
+
+            for (int i = 0; i < methods.Length; i++)
+            {
+                var m = methods[i];
+                var lname = m.Name.ToLowerInvariant();
+
+                if (lname.IndexOf("scrap", StringComparison.Ordinal) < 0) continue;
+
+                var ps = m.GetParameters();
+                if (ps.Length == 0 || ps[0].ParameterType != typeof(int)) continue;
+
+                bool looksGood = false;
+                for (int k = 0; k < nameNeedles.Length; k++)
+                {
+                    if (lname.IndexOf(nameNeedles[k].ToLowerInvariant(), StringComparison.Ordinal) >= 0)
+                    {
+                        looksGood = true;
+                        break;
+                    }
+                }
+                if (!looksGood) continue;
+
+                try
+                {
+                    var postfix = new HarmonyMethod(
+                        typeof(ScrapValueSyncPatcher).GetMethod("ScrapValuePostfix", BindingFlags.Static | BindingFlags.NonPublic));
+
+                    harmony.Patch(m, null, postfix);
+                    patched++;
+                }
+                catch (Exception e)
+                {
+                    if (Plugin.Log != null) Plugin.Log.LogWarning("ScrapValueSyncPatcher: failed to patch " + m.Name + " : " + e.Message);
+                }
+            }
+
+            if (Plugin.Log != null) Plugin.Log.LogInfo("ScrapValueSyncPatcher: patched " + patched + " scrap sync method(s).");
+        }
+
+        private static void ScrapValuePostfix(object __instance, object[] __args)
+        {
+            try
+            {
+                if (__instance == null || __args == null || __args.Length == 0) return;
+                var a0 = __args[0];
+                if (!(a0 is int)) return;
+                int value = (int)a0;
+
+                var fi = __instance.GetType().GetField("scrapValue", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (fi != null)
+                {
+                    fi.SetValue(__instance, value);
+                    Utils.InvalidateGrabbablesCache();
+                }
+            }
+            catch { }
+        }
+    }
+
+    public class ShipBoundsRebuilder : MonoBehaviour
+    {
+        private IEnumerator Start()
+        {
+            // Wait a bit for colliders to finish spawning on client
+            yield return new WaitForSeconds(5f);
+            Utils.InvalidateGrabbablesCache();
+
+            var bounds = typeof(Utils)
+                .GetMethod("GetShipBounds", BindingFlags.NonPublic | BindingFlags.Static)
+                .Invoke(null, null);
+
+            if (Plugin.Log != null) Plugin.Log.LogInfo("[ShipLootTotal] Delayed ship bounds rebuilt: " + bounds);
+            Destroy(gameObject);
+        }
+    }
+
+    [HarmonyPatch(typeof(StartOfRound), "SyncAlreadyHeldObjectsClientRpc")]
+    public static class Patch_SOR_AfterHeldSync
+    {
+        static void Postfix()
+        {
+            Plugin._lastScanPostfixAt = -999f;
         }
     }
 }
